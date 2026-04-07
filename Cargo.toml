@@ -4,16 +4,16 @@ description = "A Rust implementation of Minecraft's Text Components"
 repository = "https://github.com/Steel-Foundation/TextComponents"
 license = "GPL-3.0-or-later"
 readme = "README.md"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 exclude = ["examples/*"]
 keywords = ["minecraft", "mc", "text_components", "pretty", "terminal"]
 categories = [
-    "internationalization",
-    "localization",
-    "text-processing",
-    "value-formatting",
-    "game-engines",
+  "internationalization",
+  "localization",
+  "text-processing",
+  "value-formatting",
+  "game-engines",
 ]
 
 [lib]
@@ -23,31 +23,30 @@ custom = []
 nbt = ["dep:simdnbt"]
 serde = ["dep:serde"]
 build = [
-    "dep:heck",
-    "dep:proc-macro2",
-    "dep:quote",
-    "dep:rustc-hash",
-    "dep:serde_json",
+  "dep:heck",
+  "dep:proc-macro2",
+  "dep:quote",
+  "dep:rustc-hash",
+  "dep:serde_json",
 ]
 
 [dependencies]
-colored = "3.0.0"
-rand = { version = "0.9.2", default-features = false, features = [
-    "os_rng",
-    "std",
-    "thread_rng",
+colored = "3.1"
+rand = { version = "0.10", default-features = false, features = [
+  "std",
+  "thread_rng",
 ] }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
-simdnbt = { version = "0.9.0", optional = true }
+simdnbt = { version = "0.10", optional = true }
 # Build dependencies
 heck = { version = "0.5.0", optional = true }
-proc-macro2 = { version = "1.0.105", optional = true }
-quote = { version = "1.0.43", optional = true }
-rustc-hash = { version = "2.1.1", optional = true }
+proc-macro2 = { version = "1.0", optional = true }
+quote = { version = "1.0", optional = true }
+rustc-hash = { version = "2.1", optional = true }
 serde_json = { version = "1.0.149", optional = true }
-uuid = { version = "1.19.0", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 supports-hyperlinks = "3.2.0"
 
 [dev-dependencies]
-chrono = "0.4.42"
+chrono = "0.4"
 serde_json = "1.0.149"
