@@ -274,10 +274,9 @@ impl Content {
                     }
                     if let Some(tag) = compound.get("hat") {
                         match tag {
-                            NbtTag::String(str)
-                                if str.to_str() == "false" => {
-                                    hat = false;
-                                }
+                            NbtTag::String(str) if str.to_str() == "false" => {
+                                hat = false;
+                            }
                             NbtTag::Byte(val) => hat = *val != 0,
                             _ => (),
                         }
