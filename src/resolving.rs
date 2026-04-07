@@ -23,10 +23,8 @@ pub trait TextResolutor {
                 positions.push((pos, i, 4usize));
             }
         }
-        let mut counter = 1;
-        for (pos, _) in text.match_indices("%s") {
+        for (counter, (pos, _)) in (1..).zip(text.match_indices("%s")) {
             positions.push((pos, counter, 2usize));
-            counter += 1;
         }
         positions.sort_by_key(|(pos, _, _)| *pos);
         let mut translation = vec![];
