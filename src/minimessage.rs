@@ -1,4 +1,4 @@
-// minimessage.rs
+use smallvec::SmallVec;
 
 use crate::{
     TextComponent,
@@ -24,11 +24,8 @@ fn new_component(content: Content) -> TextComponent {
 }
 
 struct Parser {
-    /// All created nodes. Node 0 is the implicit root.
     nodes: Vec<TextComponent>,
-    /// children[i] contains indices of direct children of node i.
     children: Vec<Vec<usize>>,
-    /// Stack of currently open wrapper tags: (node_index, tag_name_lowercase).
     stack: Vec<(usize, String)>,
 }
 
@@ -40,37 +37,42 @@ impl Parser {
             stack: vec![(0, String::new())],
         };
         let len = input.len();
+        let bytes = input.as_bytes();
         let mut i = 0;
 
         while i < len {
-            // 1. Collect plain text until '<'
             let start = i;
-            while i < len && input.as_bytes()[i] != b'<' {
-                i += 1;
-            }
-            if i > start {
-                let text = unescape_text(&input[start..i]);
-                if !text.is_empty() {
-                    let comp = TextComponent::plain(text.into_owned());
-                    let parent = parser.stack.last().unwrap().0;
-                    parser.add_child_node(parent, comp);
+            if let Some(offset) = memchr::memchr(b'<', &bytes[i..]) {
+                i += offset;
+                if i > start {
+                    let text = unescape_text(&input[start..i]);
+                    if !text.is_empty() {
+                        let comp = TextComponent::plain(text.into_owned());
+                        let parent = parser.stack.last().unwrap().0;
+                        parser.add_child_node(parent, comp);
+                    }
                 }
+                i += 1;
+            } else {
+                if i < len {
+                    let text = unescape_text(&input[i..]);
+                    if !text.is_empty() {
+                        let comp = TextComponent::plain(text.into_owned());
+                        let parent = parser.stack.last().unwrap().0;
+                        parser.add_child_node(parent, comp);
+                    }
+                }
+                break;
             }
+
             if i >= len {
                 break;
             }
 
-            // 2. Skip '<'
-            i += 1;
-            if i >= len {
-                break;
-            }
-
-            // 3. Closing tag?
-            if input.as_bytes()[i] == b'/' {
+            if bytes[i] == b'/' {
                 i += 1;
                 let end = i;
-                while i < len && input.as_bytes()[i] != b'>' {
+                while i < len && bytes[i] != b'>' {
                     i += 1;
                 }
                 let tag_name = &input[end..i];
@@ -81,31 +83,29 @@ impl Parser {
                 continue;
             }
 
-            // 4. Opening or self-closing tag
             let tag_start = i;
             while i < len {
-                match input.as_bytes()[i] {
+                match bytes[i] {
                     b'>' | b':' | b'/' => break,
                     _ => i += 1,
                 }
             }
             let tag_name = &input[tag_start..i];
-            let mut args = Vec::new();
+            let mut args = SmallVec::new();
             let mut self_closing = false;
 
-            if i < len && input.as_bytes()[i] == b':' {
+            if i < len && bytes[i] == b':' {
                 i += 1;
                 args = split_args(input, &mut i, len);
             }
-            if i < len && input.as_bytes()[i] == b'/' {
+            if i < len && bytes[i] == b'/' {
                 self_closing = true;
                 i += 1;
             }
-            if i < len && input.as_bytes()[i] == b'>' {
+            if i < len && bytes[i] == b'>' {
                 i += 1;
             } else {
-                // skip invalid
-                while i < len && input.as_bytes()[i] != b'>' {
+                while i < len && bytes[i] != b'>' {
                     i += 1;
                 }
                 if i < len {
@@ -119,8 +119,22 @@ impl Parser {
         parser.finish()
     }
 
-    /// Add a child component to `parent`, return the new node index.
     fn add_child_node(&mut self, parent: usize, child: TextComponent) -> usize {
+        if let Content::Text { text: child_text } = &child.content
+            && child.format == Format::new()
+            && child.interactions == Default::default()
+            && let Some(&last_idx) = self.children[parent].last()
+        {
+            let last_node = &mut self.nodes[last_idx];
+            if let Content::Text { text: last_text } = &mut last_node.content
+                && last_node.format == Format::new()
+                && last_node.interactions == Default::default()
+            {
+                last_text.to_mut().push_str(child_text);
+                return last_idx;
+            }
+        }
+
         let idx = self.nodes.len();
         self.nodes.push(child);
         self.children.push(Vec::new());
@@ -128,29 +142,21 @@ impl Parser {
         idx
     }
 
-    /// Push a wrapper: add child component and optionally push its index + tag name onto the stack.
     fn push_tag_to_stack(
         &mut self,
         parent: usize,
         comp: TextComponent,
-        tag_name: String, // already lowercased, owned
+        tag_name: Option<String>,
         self_closing: bool,
     ) -> usize {
         let idx = self.add_child_node(parent, comp);
-        if !self_closing {
-            self.stack.push((idx, tag_name));
+        if !self_closing && let Some(name) = tag_name {
+            self.stack.push((idx, name));
         }
         idx
     }
 
-    /// Convenience: push a formatting-only wrapper (with empty text content).
-    fn push_format_wrapper(
-        &mut self,
-        parent: usize,
-        format: Format,
-        tag_name: String,
-        self_closing: bool,
-    ) {
+    fn push_format_wrapper(&mut self, parent: usize, format: Format, self_closing: bool) -> usize {
         let comp = TextComponent {
             content: Content::Text {
                 text: Cow::Borrowed(""),
@@ -158,175 +164,104 @@ impl Parser {
             format,
             ..Default::default()
         };
-        self.push_tag_to_stack(parent, comp, tag_name, self_closing);
+        self.push_tag_to_stack(parent, comp, None, self_closing)
     }
 
-    /// Close the nearest open tag with the given name.
     fn close_tag(&mut self, tag_name: &str) {
         let tag = tag_name.to_lowercase();
         if tag == "reset" {
-            return; // reset cannot be closed
+            return;
         }
         if let Some(pos) = self.stack.iter().rposition(|(_, name)| *name == tag) {
             self.stack.truncate(pos);
         }
     }
 
-    /// Entry point for any opening or self-closing tag.
-    fn process_open_tag(&mut self, tag_name: &str, args: Vec<Cow<str>>, self_closing: bool) {
+    fn process_open_tag(
+        &mut self,
+        tag_name: &str,
+        args: SmallVec<[Cow<'_, str>; 4]>,
+        self_closing: bool,
+    ) {
         let parent = self.stack.last().map(|s| s.0).unwrap_or(0);
         let tag_lower = tag_name.to_lowercase();
 
         match tag_lower.as_str() {
-            // Decorations
             "b" | "bold" | "!b" | "!bold" | "i" | "em" | "italic" | "!i" | "!em" | "!italic"
             | "u" | "underlined" | "!u" | "!underlined" | "st" | "strikethrough" | "!st"
             | "!strikethrough" | "obf" | "obfuscated" | "!obf" | "!obfuscated" => {
-                self.handle_decoration_tag(&tag_lower, parent, self_closing);
+                self.handle_decoration_tag(&tag_lower, parent, self_closing)
             }
-
-            // Reset
-            "reset" => {
-                self.stack.truncate(1);
-                // reset itself is never pushed onto the stack
-            }
-
-            // Shadow
-            "shadow" => {
-                self.handle_shadow_tag(args, parent, self_closing);
-            }
+            "reset" => self.stack.truncate(1),
+            "shadow" => self.handle_shadow_tag(args, parent, self_closing),
             "!shadow" => {
-                // Fully transparent shadow
                 let mut fmt = Format::new();
                 fmt.shadow_color = Some(0);
-                self.push_format_wrapper(parent, fmt, tag_lower, self_closing);
+                let idx = self.push_format_wrapper(parent, fmt, self_closing);
+                if !self_closing {
+                    self.stack.push((idx, "!shadow".to_string()));
+                }
             }
-
-            // Verbose color
             "color" | "c" | "colour" => {
-                self.handle_verbose_color_tag(tag_lower, args, parent, self_closing);
+                self.handle_verbose_color_tag(tag_lower, args, parent, self_closing)
             }
-
-            // Click
-            "click" => {
-                self.handle_click_tag(args, parent, self_closing);
-            }
-
-            // Hover
-            "hover" => {
-                self.handle_hover_tag(args, parent, self_closing);
-            }
-
-            // Insertion
-            "insert" => {
-                self.handle_insertion_tag(args, parent, self_closing);
-            }
-
-            // Font
-            "font" => {
-                self.handle_font_tag(args, parent, self_closing);
-            }
-
-            // Keybind
-            "key" => {
-                self.handle_keybind_tag(args, parent);
-            }
-
-            // Translatable
-            "lang" | "tr" | "translate" => {
-                self.handle_translate_tag(args, parent, None);
-            }
+            "click" => self.handle_click_tag(args, parent, self_closing),
+            "hover" => self.handle_hover_tag(args, parent, self_closing),
+            "insert" => self.handle_insertion_tag(args, parent, self_closing),
+            "font" => self.handle_font_tag(args, parent, self_closing),
+            "key" => self.handle_keybind_tag(args, parent),
+            "lang" | "tr" | "translate" => self.handle_translate_tag(args, parent, None),
             "lang_or" | "tr_or" | "translate_or" => {
-                self.handle_translate_tag(args, parent, Some(true));
+                self.handle_translate_tag(args, parent, Some(true))
             }
-
-            // Newline
             "newline" | "br" => {
                 self.add_child_node(parent, TextComponent::plain("\n"));
             }
-
-            // Selector
-            "selector" | "sel" => {
-                self.handle_selector_tag(args, parent);
-            }
-
-            // Score
-            "score" => {
-                self.handle_score_tag(args, parent);
-            }
-
-            // NBT
-            "nbt" | "data" => {
-                self.handle_nbt_tag(args, parent);
-            }
-
-            // Sprite
-            "sprite" => {
-                self.handle_sprite_tag(args, parent);
-            }
-
-            // Head
-            "head" => {
-                self.handle_head_tag(args, parent);
-            }
-
-            // Custom elements (only when feature "custom" is enabled)
+            "selector" | "sel" => self.handle_selector_tag(args, parent),
+            "score" => self.handle_score_tag(args, parent),
+            "nbt" | "data" => self.handle_nbt_tag(args, parent),
+            "sprite" => self.handle_sprite_tag(args, parent),
+            "head" => self.handle_head_tag(args, parent),
             #[cfg(feature = "custom")]
-            "rainbow" => {
-                // TODO: actually parse phase and direction arguments
-                let comp = new_component(Content::Custom(CustomData {
-                    id: Cow::Borrowed("rainbow"),
-                    payload: Payload::Empty,
-                }));
-                self.push_tag_to_stack(parent, comp, tag_lower, self_closing);
-            }
+            "rainbow" => self.push_custom_tag(parent, "rainbow", tag_lower, self_closing),
             #[cfg(feature = "custom")]
-            "gradient" => {
-                let comp = new_component(Content::Custom(CustomData {
-                    id: Cow::Borrowed("gradient"),
-                    payload: Payload::Empty,
-                }));
-                self.push_tag_to_stack(parent, comp, tag_lower, self_closing);
-            }
+            "gradient" => self.push_custom_tag(parent, "gradient", tag_lower, self_closing),
             #[cfg(feature = "custom")]
-            "transition" => {
-                let comp = new_component(Content::Custom(CustomData {
-                    id: Cow::Borrowed("transition"),
-                    payload: Payload::Empty,
-                }));
-                self.push_tag_to_stack(parent, comp, tag_lower, self_closing);
-            }
+            "transition" => self.push_custom_tag(parent, "transition", tag_lower, self_closing),
             #[cfg(feature = "custom")]
-            "pride" => {
-                let comp = new_component(Content::Custom(CustomData {
-                    id: Cow::Borrowed("pride"),
-                    payload: Payload::Empty,
-                }));
-                self.push_tag_to_stack(parent, comp, tag_lower, self_closing);
-            }
-
-            // Fallback: treat as a colour name or #hex code
+            "pride" => self.push_custom_tag(parent, "pride", tag_lower, self_closing),
             _ => {
-                if let Some(color) = parse_color(&tag_lower) {
-                    self.push_format_wrapper(
-                        parent,
-                        Format::new().color(color),
-                        tag_lower,
-                        self_closing,
-                    );
-                } else if tag_lower.starts_with('#')
-                    && let Some(color) = Color::from_hex(&tag_lower)
-                {
-                    self.push_format_wrapper(
-                        parent,
-                        Format::new().color(color),
-                        tag_lower,
-                        self_closing,
-                    );
+                let color = parse_color(&tag_lower).or_else(|| {
+                    if tag_lower.starts_with('#') {
+                        Color::from_hex(&tag_lower)
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(color) = color {
+                    let idx =
+                        self.push_format_wrapper(parent, Format::new().color(color), self_closing);
+                    if !self_closing {
+                        self.stack.push((idx, tag_lower.to_string()));
+                    }
                 }
-                // otherwise unknown tag → silently ignore (lenient mode)
             }
         }
+    }
+
+    #[cfg(feature = "custom")]
+    fn push_custom_tag(&mut self, parent: usize, id: &str, tag: String, self_closing: bool) {
+        let comp = new_component(Content::Custom(CustomData {
+            id: Cow::Borrowed(id),
+            payload: Payload::Empty,
+        }));
+        self.push_tag_to_stack(
+            parent,
+            comp,
+            if self_closing { None } else { Some(tag) },
+            self_closing,
+        );
     }
 
     fn handle_decoration_tag(&mut self, tag: &str, parent: usize, self_closing: bool) {
@@ -336,28 +271,39 @@ impl Parser {
             (tag, true)
         };
 
+        let f = Format::new();
         let format = match decoration {
-            "b" | "bold" => Format::new().bold(value),
-            "i" | "em" | "italic" => Format::new().italic(value),
-            "u" | "underlined" => Format::new().underlined(value),
-            "st" | "strikethrough" => Format::new().strikethrough(value),
-            "obf" | "obfuscated" => Format::new().obfuscated(value),
+            "b" | "bold" => f.bold(value),
+            "i" | "em" | "italic" => f.italic(value),
+            "u" | "underlined" => f.underlined(value),
+            "st" | "strikethrough" => f.strikethrough(value),
+            "obf" | "obfuscated" => f.obfuscated(value),
             _ => return,
         };
 
-        // tag is already lowercased; we pass it as String (cloned) because we need ownership.
-        self.push_format_wrapper(parent, format, tag.to_string(), self_closing);
+        let idx = self.push_format_wrapper(parent, format, self_closing);
+        if !self_closing {
+            self.stack.push((idx, tag.to_string()));
+        }
     }
 
-    fn handle_shadow_tag(&mut self, args: Vec<Cow<str>>, parent: usize, self_closing: bool) {
+    fn handle_shadow_tag(
+        &mut self,
+        args: SmallVec<[Cow<'_, str>; 4]>,
+        parent: usize,
+        self_closing: bool,
+    ) {
         let format = parse_shadow(&args);
-        self.push_format_wrapper(parent, format, "shadow".to_string(), self_closing);
+        let idx = self.push_format_wrapper(parent, format, self_closing);
+        if !self_closing {
+            self.stack.push((idx, "shadow".to_string()));
+        }
     }
 
     fn handle_verbose_color_tag(
         &mut self,
         tag: String,
-        args: Vec<Cow<str>>,
+        args: SmallVec<[Cow<'_, str>; 4]>,
         parent: usize,
         self_closing: bool,
     ) {
@@ -366,72 +312,108 @@ impl Parser {
             Some(c) => Format::new().color(c),
             None => Format::new(),
         };
-        self.push_format_wrapper(parent, format, tag, self_closing);
+        let idx = self.push_format_wrapper(parent, format, self_closing);
+        if !self_closing {
+            self.stack.push((idx, tag));
+        }
     }
 
-    fn handle_click_tag(&mut self, args: Vec<Cow<str>>, parent: usize, self_closing: bool) {
+    fn handle_click_tag(
+        &mut self,
+        args: SmallVec<[Cow<'_, str>; 4]>,
+        parent: usize,
+        self_closing: bool,
+    ) {
         if args.len() >= 2 {
-            let action = take_arg(&args[0]);
-            let value: String = args[1..]
-                .iter()
-                .map(|a| a.as_ref())
-                .collect::<Vec<_>>()
-                .join(":");
+            let action = take_arg(args[0].clone());
+            let value: String = args[1..].iter().fold(String::new(), |mut acc, a| {
+                if !acc.is_empty() {
+                    acc.push(':');
+                }
+                acc.push_str(a.as_ref());
+                acc
+            });
             let click = parse_click(&action, &value);
             let comp = new_component(Content::Text {
                 text: Cow::Borrowed(""),
             });
             let mut comp = comp;
             comp.interactions.click = click;
-            self.push_tag_to_stack(parent, comp, "click".to_string(), self_closing);
+            let tag_name = if self_closing {
+                None
+            } else {
+                Some("click".to_string())
+            };
+            self.push_tag_to_stack(parent, comp, tag_name, self_closing);
         }
     }
 
-    fn handle_hover_tag(&mut self, args: Vec<Cow<str>>, parent: usize, self_closing: bool) {
+    fn handle_hover_tag(
+        &mut self,
+        args: SmallVec<[Cow<'_, str>; 4]>,
+        parent: usize,
+        self_closing: bool,
+    ) {
         let hover = parse_hover(&args);
         let mut comp = new_component(Content::Text {
             text: Cow::Borrowed(""),
         });
         comp.interactions.hover = hover;
-        self.push_tag_to_stack(parent, comp, "hover".to_string(), self_closing);
+        let tag_name = if self_closing {
+            None
+        } else {
+            Some("hover".to_string())
+        };
+        self.push_tag_to_stack(parent, comp, tag_name, self_closing);
     }
 
-    fn handle_insertion_tag(&mut self, args: Vec<Cow<str>>, parent: usize, self_closing: bool) {
+    fn handle_insertion_tag(
+        &mut self,
+        args: SmallVec<[Cow<'_, str>; 4]>,
+        parent: usize,
+        self_closing: bool,
+    ) {
         if let Some(text) = args.first() {
             let mut comp = new_component(Content::Text {
                 text: Cow::Borrowed(""),
             });
-            comp.interactions.insertion = Some(Cow::Owned(take_arg(text)));
-            self.push_tag_to_stack(parent, comp, "insert".to_string(), self_closing);
+            comp.interactions.insertion = Some(Cow::Owned(take_arg(text.clone())));
+            let tag_name = if self_closing {
+                None
+            } else {
+                Some("insert".to_string())
+            };
+            self.push_tag_to_stack(parent, comp, tag_name, self_closing);
         }
     }
 
-    fn handle_font_tag(&mut self, args: Vec<Cow<str>>, parent: usize, self_closing: bool) {
-        let font = args
-            .into_iter()
-            .map(|a| match a {
-                Cow::Owned(s) => s,
-                Cow::Borrowed(s) => s.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(":");
-        self.push_format_wrapper(
-            parent,
-            Format::new().font(font),
-            "font".to_string(),
-            self_closing,
-        );
+    fn handle_font_tag(
+        &mut self,
+        args: SmallVec<[Cow<'_, str>; 4]>,
+        parent: usize,
+        self_closing: bool,
+    ) {
+        let font = args.into_iter().fold(String::new(), |mut acc, a| {
+            if !acc.is_empty() {
+                acc.push(':');
+            }
+            acc.push_str(a.as_ref());
+            acc
+        });
+        let idx = self.push_format_wrapper(parent, Format::new().font(font), self_closing);
+        if !self_closing {
+            self.stack.push((idx, "font".to_string()));
+        }
     }
 
-    fn handle_keybind_tag(&mut self, args: Vec<Cow<str>>, parent: usize) {
-        let keybind = args
-            .into_iter()
-            .map(|a| match a {
-                Cow::Owned(s) => s,
-                Cow::Borrowed(s) => s.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(":");
+    fn handle_keybind_tag(&mut self, args: SmallVec<[Cow<'_, str>; 4]>, parent: usize) {
+        let keybind = args.into_iter().fold(String::new(), |mut acc, a| {
+            if !acc.is_empty() {
+                acc.push(':');
+            }
+            acc.push_str(a.as_ref());
+            acc
+        });
         let comp = new_component(Content::Keybind {
             keybind: Cow::Owned(keybind),
         });
@@ -440,7 +422,7 @@ impl Parser {
 
     fn handle_translate_tag(
         &mut self,
-        args: Vec<Cow<str>>,
+        args: SmallVec<[Cow<'_, str>; 4]>,
         parent: usize,
         has_fallback: Option<bool>,
     ) {
@@ -473,7 +455,7 @@ impl Parser {
         }
     }
 
-    fn handle_selector_tag(&mut self, args: Vec<Cow<str>>, parent: usize) {
+    fn handle_selector_tag(&mut self, args: SmallVec<[Cow<'_, str>; 4]>, parent: usize) {
         let mut args = args;
         if let Some(sel) = take_first_arg(&mut args) {
             let separator = if let Some(sep) = take_first_arg(&mut args) {
@@ -490,7 +472,7 @@ impl Parser {
         }
     }
 
-    fn handle_score_tag(&mut self, args: Vec<Cow<str>>, parent: usize) {
+    fn handle_score_tag(&mut self, args: SmallVec<[Cow<'_, str>; 4]>, parent: usize) {
         let mut args = args;
         if let (Some(name), Some(objective)) =
             (take_first_arg(&mut args), take_first_arg(&mut args))
@@ -504,14 +486,14 @@ impl Parser {
         }
     }
 
-    fn handle_nbt_tag(&mut self, args: Vec<Cow<str>>, parent: usize) {
+    fn handle_nbt_tag(&mut self, args: SmallVec<[Cow<'_, str>; 4]>, parent: usize) {
         let args = args;
         if args.len() >= 3 {
-            let source_type = take_arg(&args[0]);
-            let id = take_arg(&args[1]);
-            let path = take_arg(&args[2]);
+            let source_type = take_arg(args[0].clone());
+            let id = take_arg(args[1].clone());
+            let path = take_arg(args[2].clone());
             let separator = if args.get(3).is_some() {
-                let sep = take_arg(&args[3]);
+                let sep = take_arg(args[3].clone());
                 Box::new(parse_minimessage(&sep))
             } else {
                 Resolvable::nbt_separator()
@@ -534,7 +516,7 @@ impl Parser {
         }
     }
 
-    fn handle_sprite_tag(&mut self, args: Vec<Cow<str>>, parent: usize) {
+    fn handle_sprite_tag(&mut self, args: SmallVec<[Cow<'_, str>; 4]>, parent: usize) {
         let mut args = args;
         let (atlas, sprite) = if args.len() == 1 {
             (None, take_first_arg(&mut args).unwrap_or_default())
@@ -552,7 +534,7 @@ impl Parser {
         self.add_child_node(parent, comp);
     }
 
-    fn handle_head_tag(&mut self, args: Vec<Cow<str>>, parent: usize) {
+    fn handle_head_tag(&mut self, args: SmallVec<[Cow<'_, str>; 4]>, parent: usize) {
         let mut args = args;
         if let Some(head_str) = take_first_arg(&mut args) {
             let outer_layer = args.first().is_none_or(|v| v.as_ref() != "false");
@@ -579,7 +561,6 @@ impl Parser {
     }
 
     fn finish(mut self) -> TextComponent {
-        // close any remaining open wrappers (root is always at 0)
         self.stack.truncate(1);
         self.build_node(0)
     }
@@ -595,16 +576,14 @@ impl Parser {
     }
 }
 
-/// Extract an owned String from a Cow, cloning only when necessary.
-fn take_arg(cow: &Cow<str>) -> String {
+fn take_arg(cow: Cow<'_, str>) -> String {
     match cow {
         Cow::Borrowed(s) => (*s).to_string(),
         Cow::Owned(s) => s.clone(),
     }
 }
 
-/// Remove the first element of a Vec<Cow<str>> and convert it to an owned String.
-fn take_first_arg(args: &mut Vec<Cow<str>>) -> Option<String> {
+fn take_first_arg(args: &mut SmallVec<[Cow<'_, str>; 4]>) -> Option<String> {
     if args.is_empty() {
         return None;
     }
@@ -615,123 +594,161 @@ fn take_first_arg(args: &mut Vec<Cow<str>>) -> Option<String> {
     })
 }
 
-/// Unescape MiniMessage text: `\<` → `<`, `\\` → `\`.
 fn unescape_text(s: &str) -> Cow<'_, str> {
     if !s.contains('\\') {
         return Cow::Borrowed(s);
     }
+    let bytes = s.as_bytes();
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('<') => result.push('<'),
-                Some('\\') => result.push('\\'),
-                Some(other) => {
-                    result.push('\\');
-                    result.push(other);
+    let mut start = 0;
+    while let Some(rel_pos) = memchr::memchr(b'\\', &bytes[start..]) {
+        let pos = start + rel_pos;
+        result.push_str(&s[start..pos]);
+        start = pos + 1;
+        if start < bytes.len() {
+            let next_byte = bytes[start];
+            match next_byte {
+                b'<' | b'\\' => {
+                    result.push(next_byte as char);
+                    start += 1;
                 }
-                None => result.push('\\'),
+                other => {
+                    result.push('\\');
+                    result.push(other as char);
+                    start += 1;
+                }
             }
         } else {
-            result.push(c);
+            result.push('\\');
+            break;
         }
+    }
+    if start < s.len() {
+        result.push_str(&s[start..]);
     }
     Cow::Owned(result)
 }
 
-/// Split the argument string of a tag (after the first `:`) into individual parameters.
-/// Returns borrowed slices when no escape processing was needed.
-fn split_args<'a>(input: &'a str, pos: &mut usize, max: usize) -> Vec<Cow<'a, str>> {
-    let mut args = Vec::new();
+fn split_args<'a>(input: &'a str, pos: &mut usize, max: usize) -> SmallVec<[Cow<'a, str>; 4]> {
+    let mut args = SmallVec::new();
+    let bytes = input.as_bytes();
     while *pos < max {
         let start = *pos;
-        if *pos < max && (input.as_bytes()[*pos] == b'"' || input.as_bytes()[*pos] == b'\'') {
-            // Quoted argument
-            let quote = input.as_bytes()[*pos];
+        if bytes[*pos] == b'"' || bytes[*pos] == b'\'' {
+            let quote = bytes[*pos];
             *pos += 1;
             let content_start = *pos;
             let mut escaped = String::new();
             let mut has_escape = false;
-            while *pos < max && input.as_bytes()[*pos] != quote {
-                if input.as_bytes()[*pos] == b'\\' && *pos + 1 < max {
-                    has_escape = true;
-                    if escaped.is_empty() && *pos > content_start {
-                        escaped.push_str(&input[content_start..*pos]);
+            loop {
+                let rem = &bytes[*pos..max];
+                match memchr::memchr2(quote, b'\\', rem) {
+                    None => {
+                        if has_escape {
+                            escaped.push_str(&input[content_start..max]);
+                            args.push(Cow::Owned(escaped));
+                        } else {
+                            args.push(Cow::Borrowed(&input[content_start..max]));
+                        }
+                        *pos = max;
+                        break;
                     }
-                    *pos += 1;
-                    match input.as_bytes()[*pos] {
-                        b'\\' => escaped.push('\\'),
-                        b'"' if quote == b'"' => escaped.push('"'),
-                        b'\'' if quote == b'\'' => escaped.push('\''),
-                        c => {
-                            escaped.push('\\');
-                            escaped.push(c as char);
+                    Some(offset) => {
+                        let found = rem[offset];
+                        let abs_pos = *pos + offset;
+                        if found == quote {
+                            if has_escape {
+                                escaped.push_str(&input[*pos..abs_pos]);
+                                args.push(Cow::Owned(escaped));
+                            } else {
+                                args.push(Cow::Borrowed(&input[*pos..abs_pos]));
+                            }
+                            *pos = abs_pos + 1;
+                            break;
+                        } else {
+                            has_escape = true;
+                            if escaped.is_empty() {
+                                escaped.push_str(&input[content_start..abs_pos]);
+                            } else {
+                                escaped.push_str(&input[*pos..abs_pos]);
+                            }
+                            *pos = abs_pos + 1;
+                            if *pos < max {
+                                let next_byte = bytes[*pos];
+                                match next_byte {
+                                    b'\\' => escaped.push('\\'),
+                                    b'"' if quote == b'"' => escaped.push('"'),
+                                    b'\'' if quote == b'\'' => escaped.push('\''),
+                                    c => {
+                                        escaped.push('\\');
+                                        escaped.push(c as char);
+                                    }
+                                }
+                                *pos += 1;
+                            } else {
+                                escaped.push('\\');
+                                args.push(Cow::Owned(escaped));
+                                *pos = max;
+                                break;
+                            }
                         }
                     }
-                } else {
-                    if has_escape {
-                        escaped.push(input.as_bytes()[*pos] as char);
-                    }
                 }
-                *pos += 1;
             }
-            if *pos < max && input.as_bytes()[*pos] == quote {
+            if *pos < max && bytes[*pos] == b':' {
                 *pos += 1;
-            }
-            args.push(if has_escape {
-                Cow::Owned(escaped)
+                continue;
             } else {
-                Cow::Borrowed(&input[content_start..*pos - 1])
-            });
-        } else {
-            // Unquoted argument (no escapes allowed)
-            while *pos < max
-                && input.as_bytes()[*pos] != b':'
-                && input.as_bytes()[*pos] != b'>'
-            {
-                *pos += 1;
+                break;
             }
-            args.push(Cow::Borrowed(&input[start..*pos]));
-        }
-        if *pos < max && input.as_bytes()[*pos] == b':' {
-            *pos += 1;
         } else {
-            break;
+            if let Some(offset) = memchr::memchr2(b':', b'>', &bytes[*pos..max]) {
+                let idx = *pos + offset;
+                let found = bytes[idx];
+                if found == b'>' {
+                    if start < idx {
+                        args.push(Cow::Borrowed(&input[start..idx]));
+                    }
+                    *pos = idx;
+                    break;
+                } else {
+                    args.push(Cow::Borrowed(&input[start..idx]));
+                    *pos = idx + 1;
+                    continue;
+                }
+            } else {
+                args.push(Cow::Borrowed(&input[start..max]));
+                *pos = max;
+                break;
+            }
         }
     }
     args
 }
 
-/// Parse a named color or hex color (without caching).
 fn parse_color(s: &str) -> Option<Color> {
-    parse_color_raw(s)
-}
-
-/// Parse a named color or hex color (without caching).
-fn parse_color_raw(s: &str) -> Option<Color> {
-    if let Some(c) = Color::from_hex(s) {
-        return Some(c);
-    }
-    match s {
-        "black" => Some(Color::Black),
-        "dark_blue" => Some(Color::DarkBlue),
-        "dark_green" => Some(Color::DarkGreen),
-        "dark_aqua" => Some(Color::DarkAqua),
-        "dark_red" => Some(Color::DarkRed),
-        "dark_purple" => Some(Color::DarkPurple),
-        "gold" => Some(Color::Gold),
-        "gray" | "grey" => Some(Color::Gray),
-        "dark_gray" | "dark_grey" => Some(Color::DarkGray),
-        "blue" => Some(Color::Blue),
-        "green" => Some(Color::Green),
-        "aqua" => Some(Color::Aqua),
-        "red" => Some(Color::Red),
-        "light_purple" => Some(Color::LightPurple),
-        "yellow" => Some(Color::Yellow),
-        "white" => Some(Color::White),
-        _ => None,
-    }
+    Color::from_hex(s).or_else(|| {
+        let color = match s {
+            "black" => Color::Black,
+            "dark_blue" => Color::DarkBlue,
+            "dark_green" => Color::DarkGreen,
+            "dark_aqua" => Color::DarkAqua,
+            "dark_red" => Color::DarkRed,
+            "dark_purple" => Color::DarkPurple,
+            "gold" => Color::Gold,
+            "gray" | "grey" => Color::Gray,
+            "dark_gray" | "dark_grey" => Color::DarkGray,
+            "blue" => Color::Blue,
+            "green" => Color::Green,
+            "aqua" => Color::Aqua,
+            "red" => Color::Red,
+            "light_purple" => Color::LightPurple,
+            "yellow" => Color::Yellow,
+            "white" => Color::White,
+            _ => return None,
+        };
+        Some(color)
+    })
 }
 
 fn color_to_rgb(color: &Color) -> (u8, u8, u8) {
@@ -818,12 +835,10 @@ fn parse_hover(args: &[Cow<str>]) -> Option<HoverEvent> {
     }
 }
 
-/// Parse a MiniMessage string into a component. Useful for nested arguments.
 fn parse_minimessage(s: &str) -> TextComponent {
     parse(s)
 }
 
-/// Helper function to parse shadow formatting.
 fn parse_shadow(args: &[Cow<str>]) -> Format {
     let mut format = Format::new();
     if args.is_empty() {
@@ -846,7 +861,7 @@ fn parse_shadow(args: &[Cow<str>]) -> Format {
                 .get(1)
                 .and_then(|a| a.parse::<f32>().ok())
                 .map(|f| (f * 255.0).round() as u8)
-                .unwrap_or(64); // 0.25 * 255
+                .unwrap_or(64);
             if let (Ok(r), Ok(g), Ok(b)) = (
                 u8::from_str_radix(&hex[0..2], 16),
                 u8::from_str_radix(&hex[2..4], 16),
@@ -875,12 +890,10 @@ mod tests {
     use crate::format::{Color, Format};
     use crate::interactivity::{ClickEvent, HoverEvent};
 
-    /// Helper to get the first (and often only) child from the implicitly created root component.
     fn first_child(comp: &TextComponent) -> &TextComponent {
         comp.children.first().expect("expected at least one child")
     }
 
-    /// Helper to get all children as a slice.
     fn children(comp: &TextComponent) -> &[TextComponent] {
         &comp.children
     }
@@ -925,7 +938,6 @@ mod tests {
     fn color_nested() {
         let root = parse("<yellow>Hello <blue>World</blue>!");
         let top_child = first_child(&root);
-        // The <yellow> wrapper is empty and has three children: "Hello ", <blue> wrapper, "!"
         assert_eq!(
             top_child.content,
             Content::Text {
@@ -1017,15 +1029,12 @@ mod tests {
     #[test]
     fn reset_clears_style() {
         let root = parse("<yellow><bold>Hello <reset>world!");
-        // Structure: root -> [yellow_wrapper, "world!"]
-        //   yellow_wrapper: empty, color=Yellow, children=[bold_wrapper]
-        //   bold_wrapper: empty, bold=true, children=["Hello "]
         let kids = children(&root);
         assert_eq!(kids.len(), 2);
 
         let yellow = &kids[0];
         assert_eq!(yellow.format.color, Some(Color::Yellow));
-        assert!(yellow.format.bold.is_none()); // bold is on the nested wrapper
+        assert!(yellow.format.bold.is_none());
         assert_eq!(yellow.children.len(), 1);
 
         let bold = &yellow.children[0];
@@ -1053,7 +1062,7 @@ mod tests {
     fn shadow_named() {
         let root = parse("<shadow:red>Shadow");
         let child = first_child(&root);
-        let expected = Format::parse_shadow_color(64, 255, 85, 85); // red (255,85,85) + default alpha 64
+        let expected = Format::parse_shadow_color(64, 255, 85, 85);
         assert_eq!(child.format.shadow_color, Some(expected));
     }
 
@@ -1061,7 +1070,7 @@ mod tests {
     fn shadow_alpha() {
         let root = parse("<shadow:aqua:0.5>Test");
         let child = first_child(&root);
-        let expected = Format::parse_shadow_color(128, 85, 255, 255); // aqua (85,255,255), alpha 0.5*255≈128
+        let expected = Format::parse_shadow_color(128, 85, 255, 255);
         assert_eq!(child.format.shadow_color, Some(expected));
     }
 
@@ -1298,7 +1307,6 @@ mod tests {
                 assert_eq!(msg.key, "commands.drop.success.single");
                 let args = msg.args.as_ref().unwrap();
                 assert_eq!(args.len(), 2);
-                // first arg is a red "1"
                 let arg1 = &args[0];
                 let red_child = arg1.children.first().unwrap();
                 assert_eq!(red_child.format.color, Some(Color::Red));
@@ -1308,7 +1316,6 @@ mod tests {
                         text: Cow::Borrowed("1")
                     }
                 );
-                // second arg is a blue "Stone"
                 let arg2 = &args[1];
                 let blue_child = arg2.children.first().unwrap();
                 assert_eq!(blue_child.format.color, Some(Color::Blue));
@@ -1341,23 +1348,11 @@ mod tests {
     fn newline() {
         let root = parse("Line1<newline>Line2");
         let kids = children(&root);
-        assert_eq!(kids.len(), 3); // "Line1", newline, "Line2"
+        assert_eq!(kids.len(), 1);
         assert_eq!(
             kids[0].content,
             Content::Text {
-                text: Cow::Borrowed("Line1")
-            }
-        );
-        assert_eq!(
-            kids[1].content,
-            Content::Text {
-                text: Cow::Borrowed("\n")
-            }
-        );
-        assert_eq!(
-            kids[2].content,
-            Content::Text {
-                text: Cow::Borrowed("Line2")
+                text: Cow::Borrowed("Line1\nLine2")
             }
         );
     }
@@ -1436,7 +1431,6 @@ mod tests {
 
     #[test]
     fn nbt_with_interpret() {
-        // Use an explicit separator before "interpret" to match the parser's argument layout.
         let root = parse("<nbt:block:12 34 56:Items:, :interpret>");
         let child = first_child(&root);
         match &child.content {
@@ -1617,14 +1611,12 @@ mod tests {
         let root = parse(r"\\<red>test");
         let kids = children(&root);
         assert_eq!(kids.len(), 2);
-        // first child is the escaped backslash
         assert_eq!(
             kids[0].content,
             Content::Text {
                 text: Cow::Owned("\\".into())
             }
         );
-        // second child is the <red> wrapper containing "test"
         let red_wrapper = &kids[1];
         assert_eq!(red_wrapper.format.color, Some(Color::Red));
         assert_eq!(red_wrapper.children.len(), 1);
@@ -1666,7 +1658,6 @@ mod tests {
 
     #[test]
     fn quoted_args_with_escaped_quote() {
-        // backslash-escape the quote inside the string
         let root = parse(r"<hover:show_text:'It\'s a test'>Hover");
         let child = first_child(&root);
         match &child.interactions.hover {
