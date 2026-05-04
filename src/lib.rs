@@ -17,6 +17,8 @@ pub mod fmt;
 pub mod format;
 pub mod interactivity;
 pub mod minimessage;
+#[cfg(test)]
+mod minimessage_tests;
 #[cfg(feature = "nbt")]
 pub mod nbt;
 pub mod parse;
