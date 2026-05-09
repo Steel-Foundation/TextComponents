@@ -73,7 +73,7 @@ println!("{:p}", component);
 - [x] Terminal integration
 - [x] Serde integration
 - [x] SimdNbt integration
-- [ ] MiniMessages integration
+- [x] MiniMessage integration
 - [ ] Extensibility integration
 
 ### Test
